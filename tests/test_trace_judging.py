@@ -1382,3 +1382,41 @@ def test_continuing_history_reserves_capture_for_the_new_request(
         if event["edit"].get("message", {}).get("role") == "user"
     ]
     assert users == ["Look up a record.", "Again."]
+
+
+@pytest.mark.parametrize("wrapper_kind", ["CHAIN", "AGENT", "LLM"])
+@pytest.mark.parametrize("different_trace", [False, True])
+def test_unrelated_wrapper_cannot_expire_an_unobserved_capture(
+    tmp_path, wrapper_kind, different_trace
+):
+    first_history = historical_tool_messages()
+    first_history[-1]["content"] = "first-receipt"
+    second_history = historical_tool_messages()
+    second_history[-1]["content"] = "second-receipt"
+    second_trace = "trace-two" if different_trace else "trace-one"
+    first = captured_observation(
+        "trace-one", 1, "call-1", "first-receipt", first_history
+    )
+    second = captured_observation(
+        second_trace, 5, "call-1", "second-receipt", second_history
+    )
+    second[1].update(parentSpanId="wrapper", startTimeUnixNano="8", endTimeUnixNano="9")
+    wrapper = span(
+        "captured-session", wrapper_kind, **{"input.value": "Prepare the response."}
+    )
+    wrapper.update(
+        traceId=second_trace,
+        spanId="wrapper",
+        startTimeUnixNano="7",
+        endTimeUnixNano="10",
+    )
+    path = tmp_path / "traces.json"
+    write_spans(path, [*first, *second, wrapper])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    calls = [
+        event["edit"] for event in row["events"] if event["edit"]["type"] == "tool_call"
+    ]
+    assert [call["tool_result"] for call in calls] == [
+        "first-receipt",
+        "second-receipt",
+    ]

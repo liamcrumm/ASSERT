@@ -421,8 +421,6 @@ def _spans_to_events(
     pending_calls: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     previous_calls: dict[tuple[tuple[str, str, str], int], dict[str, Any]] = {}
     history_observations: dict[tuple[str, tuple[str, str, str], int], dict[str, Any]] = {}
-    capture_order: dict[int, int] = {}
-    previous_capture_order = 0
     mirrored_outputs = _mirrored_orchestration_outputs(spans) if include_inputs else set()
     if include_inputs:
         timeline = _import_timeline(spans)
@@ -444,7 +442,7 @@ def _spans_to_events(
                 common = _common_import_messages(previous_inputs, inputs)
             fresh_captures = _fresh_import_captures(
                 inputs, common, span.trace_id, previous_calls, history_observations,
-                pending_calls, capture_order, previous_capture_order,
+                pending_calls,
             )
             occurrences: dict[tuple[str, str, str], int] = {}
             for message_index, message in enumerate(inputs):
@@ -529,7 +527,6 @@ def _spans_to_events(
                 previous_inputs = inputs
                 previous_trace_id = span.trace_id
                 previous_calls = current_calls
-                previous_capture_order = len(capture_order)
         if phase == 0:
             continue
         event_start = len(acc.events)
@@ -573,7 +570,6 @@ def _spans_to_events(
                     )
                     if key is not None:
                         pending_calls.setdefault(key, []).append(edit)
-                        capture_order[id(edit)] = len(capture_order) + 1
                 if role == "assistant" and isinstance(text, str) and text:
                     key = (role, text)
                     pending_history.setdefault(key, []).append(event)
@@ -597,9 +593,11 @@ def _fresh_import_captures(
     previous_calls: dict[_ImportOccurrence, dict[str, Any]],
     observations: dict[tuple[str, _ImportCallKey, int], dict[str, Any]],
     pending_calls: dict[_ImportCallKey, list[dict[str, Any]]],
-    capture_order: dict[int, int], previous_capture_order: int,
 ) -> dict[_ImportOccurrence, dict[str, Any]]:
-    """Reserve new captures for new requests before replacing repeated observations."""
+    """Reserve captures for new requests before replacing repeated observations.
+
+    Pending captures remain eligible until matched, even across unrelated inputs.
+    """
     counts: dict[_ImportCallKey, int] = {}
     requests: list[tuple[_ImportOccurrence, dict[str, Any] | None]] = []
     awaiting: dict[str, list[_ImportOccurrence]] = {}
@@ -636,8 +634,7 @@ def _fresh_import_captures(
         key, _ = occurrence
         candidates = [
             edit for edit in pending_calls.get(key, [])
-            if capture_order.get(id(edit), 0) > previous_capture_order
-            and id(edit) not in selected_ids
+            if id(edit) not in selected_ids
         ]
         if len(candidates) <= reserved.get(key, 0):
             continue
