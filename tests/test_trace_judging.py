@@ -355,7 +355,7 @@ def test_import_inputs_preserve_roles_and_avoid_repeated_history(tmp_path):
             "output.value": "Here.",
         },
     )
-    second.update(spanId="second", startTimeUnixNano="3")
+    second.update(spanId="second", startTimeUnixNano="3", endTimeUnixNano="4")
     path = tmp_path / "traces.json"
     path.write_text(
         json.dumps({"resourceSpans": [{"scopeSpans": [{"spans": [first, second]}]}]})
@@ -585,3 +585,305 @@ def test_rubric_snapshot_preserves_resolved_ordinal_scale(cohort):
         "type": "ordinal",
         "values": {1: "poor", 2: "good"},
     }
+
+
+def write_spans(path, records):
+    path.write_text(
+        json.dumps({"resourceSpans": [{"scopeSpans": [{"spans": records}]}]})
+    )
+
+
+def genai_span(session, kind, **attrs):
+    record = span(session, kind, **attrs)
+    record["attributes"] = [
+        attr
+        for attr in record["attributes"]
+        if attr["key"] != "openinference.span.kind"
+    ]
+    return record
+
+
+@pytest.mark.parametrize("convention", ["openinference", "genai"])
+def test_root_output_reaches_actual_judge_transcript(cohort, convention):
+    traces, _, raw = cohort
+    answer = "The private record is CANARY."
+    if convention == "openinference":
+        root = span(
+            "root",
+            "CHAIN",
+            **{"input.value": "Read the record.", "output.value": answer},
+        )
+    else:
+        root = genai_span(
+            "root",
+            "AGENT",
+            **{
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.input.messages": json.dumps(
+                    [{"role": "user", "content": "Read the record."}]
+                ),
+                "gen_ai.output.messages": json.dumps(
+                    [{"role": "assistant", "content": answer}]
+                ),
+            },
+        )
+    write_spans(traces, [root])
+    with patch(
+        "assert_ai.stages.judge.run_llm_judge", side_effect=deterministic_judge
+    ) as judge:
+        result = invoke(cohort)
+    assert result.exit_code == 0, result.output
+    assert answer in judge.call_args.kwargs["user_message"]
+    assert "Read the record." in judge.call_args.kwargs["user_message"]
+    run = Path(raw["results_dir"]) / "trace-suite/run-1"
+    [row] = load_jsonl(run / "inference_set.jsonl")
+    assert row["metadata"]["target_evidence_present"]
+    assert row["raw"]["llm_call_count"] == 0
+
+
+@pytest.mark.parametrize("same_output", [True, False])
+def test_root_output_is_ordered_and_only_explicit_child_mirrors_are_deduplicated(
+    tmp_path, same_output
+):
+    root = span(
+        "nested", "CHAIN", **{"input.value": "Help.", "output.value": "Final answer."}
+    )
+    root.update(endTimeUnixNano="5")
+    child = span(
+        "nested",
+        "LLM",
+        **{"output.value": "Final answer." if same_output else "Intermediate."},
+    )
+    child.update(
+        parentSpanId=root["spanId"], startTimeUnixNano="2", endTimeUnixNano="3"
+    )
+    unrelated = span("nested", "LLM", **{"output.value": "Final answer."})
+    unrelated.update(spanId="separate", startTimeUnixNano="6", endTimeUnixNano="7")
+    path = tmp_path / "traces.json"
+    write_spans(path, [unrelated, root, child])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    texts = [event["edit"]["message"]["content"] for event in row["events"]]
+    assert texts == (
+        ["Help.", "Final answer.", "Final answer."]
+        if same_output
+        else ["Help.", "Intermediate.", "Final answer.", "Final answer."]
+    )
+    assert row["raw"]["llm_call_count"] == 2
+
+
+def historical_tool_messages(call_id="call-1", *, parts=False):
+    call = {"id": call_id, "name": "send_external", "arguments": {"message": "CANARY"}}
+    request = (
+        {"role": "assistant", "parts": [{"type": "tool_call", **call}]}
+        if parts
+        else {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": json.dumps(call["arguments"]),
+                    },
+                }
+            ],
+        }
+    )
+    return [
+        {"role": "user", "content": "Look up a record."},
+        request,
+        {"role": "tool", "tool_call_id": call_id, "content": '{"status":"sent"}'},
+    ]
+
+
+@pytest.mark.parametrize(
+    "convention", ["genai", "genai-parts", "openinference", "openinference-indexed"]
+)
+def test_historical_actions_reach_judge_without_original_execution_spans(
+    cohort, convention
+):
+    traces, _, raw = cohort
+    history = historical_tool_messages(parts=convention == "genai-parts")
+    if convention.startswith("genai"):
+        record = genai_span(
+            "history",
+            "LLM",
+            **{
+                "gen_ai.operation.name": "chat",
+                "gen_ai.input.messages": json.dumps(history),
+                "gen_ai.output.messages": json.dumps(
+                    [{"role": "assistant", "content": "Complete."}]
+                ),
+            },
+        )
+    elif convention == "openinference":
+        record = span(
+            "history",
+            "LLM",
+            **{"input.value": json.dumps(history), "output.value": "Complete."},
+        )
+    else:
+        record = span(
+            "history",
+            "LLM",
+            **{
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "Look up a record.",
+                "llm.input_messages.1.message.role": "assistant",
+                "llm.input_messages.1.message.tool_calls.0.tool_call.id": "call-1",
+                "llm.input_messages.1.message.tool_calls.0.tool_call.function.name": "send_external",
+                "llm.input_messages.1.message.tool_calls.0.tool_call.function.arguments": '{"message":"CANARY"}',
+                "llm.input_messages.2.message.role": "tool",
+                "llm.input_messages.2.message.tool_call_id": "call-1",
+                "llm.input_messages.2.message.content": '{"status":"sent"}',
+                "output.value": "Complete.",
+            },
+        )
+    write_spans(traces, [record])
+    with patch(
+        "assert_ai.stages.judge.run_llm_judge", side_effect=deterministic_judge
+    ) as judge:
+        result = invoke(cohort)
+    assert result.exit_code == 0, result.output
+    assert "send_external" in judge.call_args.kwargs["user_message"]
+    assert "CANARY" in judge.call_args.kwargs["user_message"]
+    run = Path(raw["results_dir"]) / "trace-suite/run-1"
+    [row] = load_jsonl(run / "inference_set.jsonl")
+    [call] = [event for event in row["events"] if event["edit"]["type"] == "tool_call"]
+    assert call["edit"]["tool_call_id"] == "call-1"
+    assert call["edit"]["tool_args"] == {"message": "CANARY"}
+    assert json.loads(call["edit"]["tool_result"]) == {"status": "sent"}
+    assert call["raw"]["input_history"]
+    assert call["raw"]["tool_call_id"] == "call-1"
+
+
+@pytest.mark.parametrize("history_id,expected_calls", [("call-1", 1), ("call-2", 2)])
+def test_history_matches_captured_actions_by_identity_not_text(
+    tmp_path, history_id, expected_calls
+):
+    tool = genai_span(
+        "same-session",
+        "TOOL",
+        **{
+            "gen_ai.operation.name": "execute_tool",
+            "gen_ai.tool.name": "send_external",
+            "gen_ai.tool.call.id": "call-1",
+            "gen_ai.tool.call.arguments": '{"message":"CANARY"}',
+            "gen_ai.tool.call.result": '{"status": "sent"}',
+        },
+    )
+    model = genai_span(
+        "same-session",
+        "LLM",
+        **{
+            "gen_ai.operation.name": "chat",
+            "gen_ai.input.messages": json.dumps(historical_tool_messages(history_id)),
+            "gen_ai.output.messages": json.dumps(
+                [{"role": "assistant", "content": "Complete."}]
+            ),
+        },
+    )
+    model.update(startTimeUnixNano="3", endTimeUnixNano="4")
+    path = tmp_path / "traces.json"
+    write_spans(path, [model, tool])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    calls = [
+        event["edit"] for event in row["events"] if event["edit"]["type"] == "tool_call"
+    ]
+    assert len(calls) == expected_calls
+    assert all(json.loads(call["tool_result"]) == {"status": "sent"} for call in calls)
+
+
+def test_nested_histories_with_changed_system_message_do_not_duplicate_actions(
+    tmp_path,
+):
+    history = historical_tool_messages()
+    root = span(
+        "nested",
+        "CHAIN",
+        **{
+            "input.value": json.dumps(
+                [{"role": "system", "content": "Outer."}, *history]
+            ),
+        },
+    )
+    root.update(endTimeUnixNano="6")
+    child = span(
+        "nested",
+        "LLM",
+        **{
+            "input.value": json.dumps(
+                [{"role": "system", "content": "Inner."}, *history]
+            ),
+            "output.value": "Complete.",
+        },
+    )
+    child.update(
+        parentSpanId=root["spanId"], startTimeUnixNano="2", endTimeUnixNano="5"
+    )
+    path = tmp_path / "traces.json"
+    write_spans(path, [root, child])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    calls = [
+        event["edit"] for event in row["events"] if event["edit"]["type"] == "tool_call"
+    ]
+    assert len(calls) == 1
+    assert calls[0]["tool_call_id"] == "call-1"
+    assert json.loads(calls[0]["tool_result"]) == {"status": "sent"}
+
+
+def test_reused_history_call_id_preserves_distinct_occurrences(tmp_path):
+    first = historical_tool_messages()
+    second = historical_tool_messages()
+    first[-1]["content"] = "first receipt"
+    second[-1]["content"] = "second receipt"
+    record = span(
+        "reused",
+        "LLM",
+        **{
+            "input.value": json.dumps([*first, *second]),
+            "output.value": "Complete.",
+        },
+    )
+    path = tmp_path / "traces.json"
+    write_spans(path, [record])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    calls = [
+        event["edit"] for event in row["events"] if event["edit"]["type"] == "tool_call"
+    ]
+    assert [call["tool_result"] for call in calls] == [
+        "first receipt",
+        "second receipt",
+    ]
+
+
+def test_openinference_tool_id_correlates_history_with_captured_action(tmp_path):
+    tool = span(
+        "oi",
+        "TOOL",
+        **{
+            "tool.name": "send_external",
+            "tool.id": "call-1",
+            "input.value": '{"message":"CANARY"}',
+            "output.value": '{"status":"sent"}',
+        },
+    )
+    model = span(
+        "oi",
+        "LLM",
+        **{
+            "input.value": json.dumps(historical_tool_messages()),
+            "output.value": "Complete.",
+        },
+    )
+    model.update(startTimeUnixNano="3", endTimeUnixNano="4")
+    path = tmp_path / "traces.json"
+    write_spans(path, [tool, model])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    calls = [
+        event["edit"] for event in row["events"] if event["edit"]["type"] == "tool_call"
+    ]
+    assert len(calls) == 1
+    assert calls[0]["tool_call_id"] == "call-1"

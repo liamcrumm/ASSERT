@@ -221,6 +221,13 @@ Request text is retained where the export provides it, but a response-only expor
 establish request context or prove tool enforcement. A recorded tool request without an
 execution receipt is an attempted action, not proof of a side effect.
 
+Imports retain final outputs recorded on root chain/agent spans and structured tool
+requests in message history. Matching parent/child outputs are deduplicated only when
+the span lineage identifies the child; tool history is correlated by call ID, name,
+and arguments. Conflicting recorded results fail the import instead of choosing a
+result silently. Evidence eligibility is checked against the reconstructed transcript,
+so a source field that the parser cannot represent does not make an empty row scoreable.
+
 ## `acs generate`
 
 Requires the `acs` extra: `python -m pip install -e ".[acs]"` (editable install of the ASSERT
