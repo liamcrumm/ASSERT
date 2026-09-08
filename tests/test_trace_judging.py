@@ -603,14 +603,16 @@ def genai_span(session, kind, **attrs):
     return record
 
 
-@pytest.mark.parametrize("convention", ["openinference", "genai"])
+@pytest.mark.parametrize(
+    "convention", ["openinference", "openinference-agent", "genai"]
+)
 def test_root_output_reaches_actual_judge_transcript(cohort, convention):
     traces, _, raw = cohort
     answer = "The private record is CANARY."
-    if convention == "openinference":
+    if convention.startswith("openinference"):
         root = span(
             "root",
-            "CHAIN",
+            "AGENT" if convention == "openinference-agent" else "CHAIN",
             **{"input.value": "Read the record.", "output.value": answer},
         )
     else:
@@ -639,14 +641,19 @@ def test_root_output_reaches_actual_judge_transcript(cohort, convention):
     [row] = load_jsonl(run / "inference_set.jsonl")
     assert row["metadata"]["target_evidence_present"]
     assert row["raw"]["llm_call_count"] == 0
+    answers = [
+        event["edit"].get("message", {}).get("content") for event in row["events"]
+    ]
+    assert answers.count(answer) == 1
 
 
 @pytest.mark.parametrize("same_output", [True, False])
+@pytest.mark.parametrize("kind", ["CHAIN", "AGENT"])
 def test_root_output_is_ordered_and_only_explicit_child_mirrors_are_deduplicated(
-    tmp_path, same_output
+    tmp_path, same_output, kind
 ):
     root = span(
-        "nested", "CHAIN", **{"input.value": "Help.", "output.value": "Final answer."}
+        "nested", kind, **{"input.value": "Help.", "output.value": "Final answer."}
     )
     root.update(endTimeUnixNano="5")
     child = span(
@@ -887,3 +894,158 @@ def test_openinference_tool_id_correlates_history_with_captured_action(tmp_path)
     ]
     assert len(calls) == 1
     assert calls[0]["tool_call_id"] == "call-1"
+
+
+def test_structured_genai_receipt_reaches_judge(cohort):
+    traces, _, raw = cohort
+    history = historical_tool_messages(parts=True)
+    history[-1] = {
+        "role": "tool",
+        "parts": [
+            {
+                "type": "tool_call_response",
+                "id": "call-1",
+                "response": {"status": "sent", "receipt": "TRANSFER_RECEIPT"},
+            }
+        ],
+    }
+    record = genai_span(
+        "receipt",
+        "LLM",
+        **{
+            "gen_ai.operation.name": "chat",
+            "gen_ai.input.messages": json.dumps(history),
+            "gen_ai.output.messages": json.dumps(
+                [{"role": "assistant", "content": "Complete."}]
+            ),
+        },
+    )
+    write_spans(traces, [record])
+    with patch(
+        "assert_ai.stages.judge.run_llm_judge", side_effect=deterministic_judge
+    ) as judge:
+        result = invoke(cohort)
+    assert result.exit_code == 0, result.output
+    assert "TRANSFER_RECEIPT" in judge.call_args.kwargs["user_message"]
+    run = Path(raw["results_dir"]) / "trace-suite/run-1"
+    [row] = load_jsonl(run / "inference_set.jsonl")
+    [call] = [
+        event["edit"] for event in row["events"] if event["edit"]["type"] == "tool_call"
+    ]
+    assert call["tool_call_id"] == "call-1"
+    assert json.loads(call["tool_result"]) == {
+        "status": "sent",
+        "receipt": "TRANSFER_RECEIPT",
+    }
+
+
+def test_mixed_assistant_history_text_precedes_tool_action(tmp_path):
+    history = historical_tool_messages()
+    history[1]["content"] = "I will send it now."
+    record = span(
+        "mixed",
+        "LLM",
+        **{
+            "input.value": json.dumps(history),
+            "output.value": "Complete.",
+        },
+    )
+    path = tmp_path / "traces.json"
+    write_spans(path, [record])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    assert [event["edit"]["type"] for event in row["events"]] == [
+        "add_message",
+        "add_message",
+        "tool_call",
+        "add_message",
+    ]
+    assert row["events"][1]["edit"]["message"]["content"] == "I will send it now."
+    assert json.loads(row["events"][2]["edit"]["tool_result"]) == {"status": "sent"}
+
+
+@pytest.mark.parametrize("tool_start", ["1", "2"])
+def test_equal_timestamps_preserve_one_execution(tmp_path, tool_start):
+    tool = span(
+        "tied",
+        "TOOL",
+        **{
+            "tool.name": "send_external",
+            "tool.id": "call-1",
+            "input.value": '{"message":"CANARY"}',
+            "output.value": '{"status":"sent"}',
+        },
+    )
+    tool.update(startTimeUnixNano=tool_start, endTimeUnixNano="2")
+    model = span(
+        "tied",
+        "LLM",
+        **{
+            "input.value": json.dumps(historical_tool_messages()),
+            "output.value": "Complete.",
+        },
+    )
+    model.update(startTimeUnixNano="2", endTimeUnixNano="3")
+    path = tmp_path / "traces.json"
+    write_spans(path, [model, tool])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    calls = [
+        event["edit"] for event in row["events"] if event["edit"]["type"] == "tool_call"
+    ]
+    assert len(calls) == 1
+    assert json.loads(calls[0]["tool_result"]) == {"status": "sent"}
+
+
+def test_zero_duration_model_keeps_own_input_before_output(tmp_path):
+    record = span(
+        "instant", "LLM", **{"input.value": "Question.", "output.value": "Answer."}
+    )
+    record.update(startTimeUnixNano="2", endTimeUnixNano="2")
+    path = tmp_path / "traces.json"
+    write_spans(path, [record])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    assert [event["edit"]["message"]["content"] for event in row["events"]] == [
+        "Question.",
+        "Answer.",
+    ]
+
+
+@pytest.mark.parametrize("text_captured", [False, True])
+def test_history_context_precedes_its_matched_captured_action(tmp_path, text_captured):
+    history = historical_tool_messages()
+    history[1]["content"] = "I will send it now."
+    tool = span(
+        "captured",
+        "TOOL",
+        **{
+            "tool.name": "send_external",
+            "tool.id": "call-1",
+            "input.value": '{"message":"CANARY"}',
+            "output.value": '{"status":"sent"}',
+        },
+    )
+    model = span(
+        "captured",
+        "LLM",
+        **{
+            "input.value": json.dumps(history),
+            "output.value": "Complete.",
+        },
+    )
+    model.update(startTimeUnixNano="3", endTimeUnixNano="4")
+    path = tmp_path / "traces.json"
+    records = [tool, model]
+    if text_captured:
+        source = span("captured", "LLM", **{"output.value": "I will send it now."})
+        source.update(
+            spanId="source-message", startTimeUnixNano="0", endTimeUnixNano="1"
+        )
+        records.insert(0, source)
+    write_spans(path, records)
+    [row] = parse_otel_traces(path, include_inputs=True)
+    assert [event["edit"]["type"] for event in row["events"]] == [
+        "add_message",
+        "add_message",
+        "tool_call",
+        "add_message",
+    ]
+    assert row["events"][1]["edit"]["message"]["content"] == "I will send it now."

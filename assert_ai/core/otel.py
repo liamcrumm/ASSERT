@@ -412,23 +412,33 @@ def _spans_to_events(
     acc = _EventAccumulator()
     previous_inputs: list[dict[str, Any]] = []
     previous_trace_id: str | None = None
-    pending_history: dict[tuple[str, str], int] = {}
+    pending_history: dict[tuple[str, str], list[dict[str, Any]]] = {}
     pending_calls: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     history_calls: dict[str, list[dict[str, Any]]] = {}
     history_observations: dict[tuple[str, tuple[str, str, str], int], dict[str, Any]] = {}
     mirrored_outputs = _mirrored_orchestration_outputs(spans) if include_inputs else set()
     if include_inputs:
+        if any(span.end_time_ns < span.start_time_ns for span in spans):
+            raise ValueError("Imported spans must end at or after their start time")
         timeline = sorted(
-            (timestamp, phase, index, span)
+            (timestamp, priority, index, phase, span)
             for index, span in enumerate(spans)
-            for timestamp, phase in ((span.start_time_ns, 0), (span.end_time_ns, 1))
+            for timestamp, priority, phase in (
+                (span.start_time_ns, 1, 0),
+                (
+                    span.end_time_ns,
+                    0 if span.end_time_ns > span.start_time_ns or span.kind == "TOOL" else 2,
+                    1,
+                ),
+            )
         )
     else:
-        timeline = [(span.start_time_ns, 1, index, span) for index, span in enumerate(spans)]
+        timeline = [(span.start_time_ns, 0, index, 1, span) for index, span in enumerate(spans)]
 
-    for _, phase, _, span in timeline:
+    for _, _, _, phase, span in timeline:
         if phase == 0 and span.kind in {"LLM", "AGENT", "CHAIN"}:
             inputs = _import_input_messages(span)
+            history_start = len(acc.events)
             common = 0
             if span.trace_id == previous_trace_id or len(inputs) > len(previous_inputs):
                 while (
@@ -446,6 +456,16 @@ def _spans_to_events(
                     "span_id": span.span_id,
                     "input_history": True,
                 }
+                text = _message_text(message)
+                if message_index >= common and role != "tool" and text:
+                    key = (role, text)
+                    if role == "assistant" and pending_history.get(key):
+                        captured = pending_history[key].pop(0)
+                        history_start = _place_history_before(
+                            acc.events, history_start, captured["edit"]
+                        )
+                    else:
+                        _append_import_message(acc, role, text, provenance)
                 if role == "assistant":
                     for call in _merge_tool_call_carriers(
                         _extract_tool_calls(message), _extract_tool_calls_from_parts(message)
@@ -463,6 +483,11 @@ def _spans_to_events(
                             edit = history_observations[observation]
                         elif matches:
                             edit = matches.pop(0)
+                            # Snapshot history can precede a captured action even
+                            # when the snapshot's own span starts after that action.
+                            history_start = _place_history_before(
+                                acc.events, history_start, edit
+                            )
                         else:
                             edit = acc.emit_tool_call(
                                 call["name"], call["args"], call_id=call["call_id"]
@@ -474,34 +499,19 @@ def _spans_to_events(
                             history_calls.setdefault(call["call_id"], []).append(edit)
                 if message_index < common:
                     continue
-                text = _message_text(message)
                 if role == "tool":
-                    if not text and message.get("content") is not None:
-                        text = _genai_tool_result_str(message["content"])
-                    call_id = _safe_tool_call_id(message.get("tool_call_id") or message.get("id"))
-                    matches = history_calls.get(call_id, []) if call_id else []
-                    if matches:
-                        edit = matches.pop(0)
-                        if edit["tool_result"] and _coerce_json(edit["tool_result"]) != _coerce_json(text):
-                            raise ValueError("Conflicting recorded results for an imported tool call")
-                        edit["tool_result"] = _genai_tool_result_str(text)
-                        continue
-                    if call_id:
-                        provenance["tool_call_id"] = call_id
-                if text:
-                    key = (role, text)
-                    if role == "assistant" and pending_history.get(key, 0):
-                        pending_history[key] -= 1
-                        continue
-                    acc.events.append({
-                        "view": ["target", "combined"],
-                        "actor": {"user": "tester", "assistant": "target"}.get(role, role),
-                        "edit": {
-                            "type": "add_message",
-                            "message": {"role": role, "content": text},
-                        },
-                        "raw": provenance,
-                    })
+                    for call_id, result in _import_tool_results(message):
+                        matches = history_calls.get(call_id, []) if call_id else []
+                        if matches:
+                            edit = matches.pop(0)
+                            if edit["tool_result"] and _coerce_json(edit["tool_result"]) != _coerce_json(result):
+                                raise ValueError("Conflicting recorded results for an imported tool call")
+                            edit["tool_result"] = result
+                        else:
+                            result_provenance = dict(provenance)
+                            if call_id:
+                                result_provenance["tool_call_id"] = call_id
+                            _append_import_message(acc, "tool", result, result_provenance)
             if inputs:
                 previous_inputs = inputs
                 previous_trace_id = span.trace_id
@@ -510,6 +520,9 @@ def _spans_to_events(
         event_start = len(acc.events)
         if span.convention == "gen_ai":
             _genai_span_to_events(span, acc)
+        elif include_inputs and span.kind == "AGENT":
+            # Offline orchestration outputs share one emission/deduplication path.
+            acc.note_node(span.attributes.get(_LANGGRAPH_NODE_KEY, span.name))
         else:
             _openinference_span_to_events(span, acc)
         if include_inputs:
@@ -547,7 +560,7 @@ def _spans_to_events(
                         pending_calls.setdefault(key, []).append(edit)
                 if role == "assistant" and isinstance(text, str) and text:
                     key = (role, text)
-                    pending_history[key] = pending_history.get(key, 0) + 1
+                    pending_history.setdefault(key, []).append(event)
 
     aggregate = {
         "nodes_visited": acc.nodes_visited,
@@ -561,6 +574,58 @@ def _spans_to_events(
     }
 
     return acc.events, aggregate
+
+
+def _place_history_before(
+    events: list[dict[str, Any]], history_start: int, captured_edit: dict[str, Any],
+) -> int:
+    preceding = events[history_start:]
+    if not preceding:
+        return history_start
+    anchor = next(index for index, event in enumerate(events) if event["edit"] is captured_edit)
+    del events[history_start:]
+    events[anchor:anchor] = preceding
+    return len(events)
+
+
+def _append_import_message(
+    acc: _EventAccumulator, role: str, text: str, provenance: dict[str, Any],
+) -> None:
+    acc.events.append({
+        "view": ["target", "combined"],
+        "actor": {"user": "tester", "assistant": "target"}.get(role, role),
+        "edit": {
+            "type": "add_message",
+            "message": {"role": role, "content": text},
+        },
+        "raw": provenance,
+    })
+
+
+def _import_tool_results(message: dict[str, Any]) -> list[tuple[str | None, str]]:
+    """Normalize message-level and GenAI part-level execution receipts."""
+    results = []
+    for field in ("parts", "content"):
+        parts = message.get(field)
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict) or part.get("type") != "tool_call_response":
+                continue
+            if "response" not in part:
+                raise ValueError("Imported tool_call_response part is missing its response")
+            call_id = _safe_tool_call_id(part.get("id") or part.get("tool_call_id"))
+            results.append((call_id, _genai_tool_result_str(part["response"])))
+    text = _message_text(message)
+    if results:
+        if text:
+            results.append((None, text))
+        return results
+    content = message.get("content")
+    if text or content is not None:
+        call_id = _safe_tool_call_id(message.get("tool_call_id") or message.get("id"))
+        return [(call_id, text or _genai_tool_result_str(content))]
+    return []
 
 
 def _import_call_key(
