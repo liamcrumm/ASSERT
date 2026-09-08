@@ -120,12 +120,14 @@ def parse_otel_traces(
     path: str | Path,
     *,
     group_by: str = "session.id",
+    include_inputs: bool = False,
 ) -> list[dict[str, Any]]:
     """Parse OTLP JSON export into ASSERT inference rows.
 
     Args:
         path: Path to OTLP JSON file.
         group_by: Span attribute key to group spans into conversations.
+        include_inputs: Preserve recorded request messages for offline judging.
 
     Returns:
         List of inference row dicts, one per conversation. Each row has the
@@ -142,17 +144,26 @@ def parse_otel_traces(
     rows = []
     for session_id, session_spans in grouped.items():
         session_spans.sort(key=lambda s: s.start_time_ns)
-        events, aggregate = _spans_to_events(session_spans)
+        events, aggregate = _spans_to_events(session_spans, include_inputs=include_inputs)
 
         rows.append({
             "metadata": {
                 "type": "otel_import",
                 "session_id": session_id,
                 "runtime_mode": "otel_traced",
+                "trace_ids": sorted({span.trace_id for span in session_spans}),
+                "span_ids": [span.span_id for span in session_spans],
             },
             "events": events,
             "raw": aggregate,
         })
+        if include_inputs:
+            rows[-1]["metadata"]["target_evidence_present"] = any(
+                span.kind == "TOOL"
+                or bool(_span_output_value(span))
+                or bool(_span_requested_tool_calls(span))
+                for span in session_spans
+            )
 
     return rows
 
@@ -165,6 +176,8 @@ def _parse_otlp_json(path: Path) -> list[OTelSpan]:
         raise FileNotFoundError(f"OTLP trace file not found: {path}") from None
     except json.JSONDecodeError as exc:
         raise ValueError(f"Malformed JSON in OTLP trace file {path}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("resourceSpans", []), list):
+        raise ValueError("OTLP trace file must contain a resourceSpans array")
 
     spans: list[OTelSpan] = []
     for resource_span in data.get("resourceSpans", []):
@@ -379,6 +392,8 @@ class _EventAccumulator:
 
 def _spans_to_events(
     spans: list[OTelSpan],
+    *,
+    include_inputs: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Convert a group of spans into ASSERT transcript events + aggregate metadata.
 
@@ -392,12 +407,65 @@ def _spans_to_events(
         and aggregate is summary metadata for the conversation.
     """
     acc = _EventAccumulator()
+    previous_inputs: list[dict[str, Any]] = []
+    previous_trace_id: str | None = None
+    pending_history: dict[tuple[str, str], int] = {}
 
     for span in spans:
+        if include_inputs and span.kind in {"LLM", "AGENT"}:
+            inputs = _import_input_messages(span)
+            common = 0
+            if span.trace_id == previous_trace_id or len(inputs) > len(previous_inputs):
+                while (
+                    common < min(len(previous_inputs), len(inputs))
+                    and previous_inputs[common] == inputs[common]
+                ):
+                    common += 1
+            for message in inputs[common:]:
+                role = message.get("role")
+                if role not in {"user", "system", "assistant", "tool"}:
+                    continue
+                text = _message_text(message)
+                if text:
+                    key = (role, text)
+                    if role in {"assistant", "tool"} and pending_history.get(key, 0):
+                        pending_history[key] -= 1
+                        continue
+                    acc.events.append({
+                        "view": ["target", "combined"],
+                        "actor": {"user": "tester", "assistant": "target"}.get(role, role),
+                        "edit": {
+                            "type": "add_message",
+                            "message": {"role": role, "content": text},
+                        },
+                        "raw": {
+                            "trace_id": span.trace_id,
+                            "span_id": span.span_id,
+                            "input_history": True,
+                        },
+                    })
+            if inputs:
+                previous_inputs = inputs
+                previous_trace_id = span.trace_id
+        event_start = len(acc.events)
         if span.convention == "gen_ai":
             _genai_span_to_events(span, acc)
         else:
             _openinference_span_to_events(span, acc)
+        if include_inputs:
+            for event in acc.events[event_start:]:
+                event.setdefault("raw", {}).update(
+                    trace_id=span.trace_id, span_id=span.span_id,
+                )
+                edit = event["edit"]
+                message = edit.get("message", {})
+                role = message.get("role")
+                text = message.get("content")
+                if edit["type"] == "tool_call":
+                    role, text = "tool", edit.get("tool_result")
+                if role in {"assistant", "tool"} and isinstance(text, str) and text:
+                    key = (role, text)
+                    pending_history[key] = pending_history.get(key, 0) + 1
 
     aggregate = {
         "nodes_visited": acc.nodes_visited,
@@ -411,6 +479,37 @@ def _spans_to_events(
     }
 
     return acc.events, aggregate
+
+
+def _import_input_messages(span: OTelSpan) -> list[dict[str, Any]]:
+    """Read request messages without inferring roles from arbitrary JSON."""
+    attrs = span.attributes
+    if span.convention == "gen_ai":
+        value = attrs.get(_GENAI_INPUT_MESSAGES_KEY, attrs.get(_OPENCLAW_INPUT_MESSAGES_KEY))
+    else:
+        indexed: dict[int, dict[str, Any]] = {}
+        for key, value in attrs.items():
+            parts = key.split(".")
+            if (
+                len(parts) == 5
+                and parts[:2] == ["llm", "input_messages"]
+                and parts[2].isdigit()
+                and parts[3] == "message"
+            ):
+                indexed.setdefault(int(parts[2]), {})[parts[4]] = value
+        if indexed:
+            return [indexed[index] for index in sorted(indexed)]
+        value = attrs.get(_INPUT_VALUE_KEY)
+    parsed = _coerce_json(value)
+    if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
+        parsed = parsed["messages"]
+    if isinstance(parsed, list):
+        return [message for message in parsed if isinstance(message, dict)]
+    if isinstance(parsed, dict) and "role" in parsed:
+        return [parsed]
+    if isinstance(parsed, str) and parsed:
+        return [{"role": "user", "content": parsed}]
+    return []
 
 
 def _openinference_span_to_events(span: OTelSpan, acc: _EventAccumulator) -> None:
