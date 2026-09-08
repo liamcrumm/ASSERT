@@ -1952,7 +1952,7 @@ def judge_traces(traces: Path, config_path: Path, group_by: str, output: Path | 
 
     click.echo("Parse only: no judge or target was called.")
     click.echo(f"Inference set written to {inference_set_path}")
-    click.echo("Run the full pipeline with --force-stage judge to score these inference rows.")
+    click.echo("Use judge-traces without --parse-only to create a scored run.")
 
 
 @cli.group(

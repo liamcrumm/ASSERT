@@ -244,6 +244,7 @@ def test_parse_only_does_not_call_judge(cohort, tmp_path):
         result = invoke(cohort, "--parse-only", "--output", str(tmp_path / "parsed"))
     assert result.exit_code == 0, result.output
     assert "Parse only" in result.output
+    assert "without --parse-only" in result.output
     assert (tmp_path / "parsed/inference_set.jsonl").is_file()
     assert not (tmp_path / "parsed/scores.jsonl").exists()
 
@@ -1420,3 +1421,45 @@ def test_unrelated_wrapper_cannot_expire_an_unobserved_capture(
         "first-receipt",
         "second-receipt",
     ]
+
+
+@pytest.mark.parametrize("older_receipt", ["old-receipt", ""])
+@pytest.mark.parametrize("with_wrapper", [False, True])
+def test_new_request_selects_receipt_compatible_pending_capture(
+    tmp_path, older_receipt, with_wrapper
+):
+    history = historical_tool_messages()
+    history[0]["content"] = "Authorize the new send."
+    history[-1]["content"] = "new-receipt"
+    old_tool = captured_observation("trace", 1, "call-1", older_receipt, history)[0]
+    new_tool, model = captured_observation("trace", 5, "call-1", "new-receipt", history)
+    records = [old_tool, new_tool, model]
+    if with_wrapper:
+        wrapper = span("captured-session", "CHAIN", **{"input.value": "Prepare."})
+        wrapper.update(
+            traceId="trace",
+            spanId="wrapper",
+            startTimeUnixNano="3",
+            endTimeUnixNano="4",
+        )
+        records.append(wrapper)
+    path = tmp_path / "traces.json"
+    write_spans(path, records)
+    [row] = parse_otel_traces(path, include_inputs=True)
+    calls = [event for event in row["events"] if event["edit"]["type"] == "tool_call"]
+    assert [call["edit"]["tool_result"] for call in calls] == [
+        older_receipt,
+        "new-receipt",
+    ]
+    assert [call["raw"]["span_id"] for call in calls] == ["tool-1", "tool-5"]
+    authorization = next(
+        index
+        for index, event in enumerate(row["events"])
+        if event["edit"].get("message", {}).get("content") == "Authorize the new send."
+    )
+    call_positions = [
+        index
+        for index, event in enumerate(row["events"])
+        if event["edit"]["type"] == "tool_call"
+    ]
+    assert call_positions[0] < authorization < call_positions[1]

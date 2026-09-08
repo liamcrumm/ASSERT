@@ -440,7 +440,7 @@ def _spans_to_events(
                 or any(message.get("role") in {"assistant", "tool"} for message in inputs)
             ):
                 common = _common_import_messages(previous_inputs, inputs)
-            fresh_captures = _fresh_import_captures(
+            fresh_captures, fresh_context = _fresh_import_captures(
                 inputs, common, span.trace_id, previous_calls, history_observations,
                 pending_calls,
             )
@@ -456,7 +456,7 @@ def _spans_to_events(
                 }
                 context_before_calls = list(acc.events[history_start:])
                 text = _message_text(message)
-                if (message_index not in common or fresh_captures) and role != "tool" and text:
+                if (message_index not in common or fresh_context) and role != "tool" and text:
                     key = (role, text)
                     if role == "assistant" and pending_history.get(key):
                         captured = pending_history[key].pop(0)
@@ -593,8 +593,8 @@ def _fresh_import_captures(
     previous_calls: dict[_ImportOccurrence, dict[str, Any]],
     observations: dict[tuple[str, _ImportCallKey, int], dict[str, Any]],
     pending_calls: dict[_ImportCallKey, list[dict[str, Any]]],
-) -> dict[_ImportOccurrence, dict[str, Any]]:
-    """Reserve captures for new requests before replacing repeated observations.
+) -> tuple[dict[_ImportOccurrence, dict[str, Any]], bool]:
+    """Match new requests by receipt before replacing repeated observations.
 
     Pending captures remain eligible until matched, even across unrelated inputs.
     """
@@ -622,28 +622,38 @@ def _fresh_import_captures(
             for call_id, result in _import_tool_results(message):
                 if call_id and awaiting.get(call_id):
                     receipts[awaiting[call_id].pop(0)] = result
-    reserved: dict[tuple[str, str, str], int] = {}
-    for (key, _), known in requests:
-        if known is None:
-            reserved[key] = reserved.get(key, 0) + 1
     selected: dict[_ImportOccurrence, dict[str, Any]] = {}
     selected_ids: set[int] = set()
-    for occurrence, known in requests:
-        if known is None or occurrence not in receipts:
-            continue
-        key, _ = occurrence
-        candidates = [
-            edit for edit in pending_calls.get(key, [])
-            if id(edit) not in selected_ids
-        ]
-        if len(candidates) <= reserved.get(key, 0):
-            continue
-        for edit in candidates:
-            if not edit["tool_result"] or _coerce_json(edit["tool_result"]) == _coerce_json(receipts[occurrence]):
+    fresh_context = False
+    for repeated in (False, True):
+        for occurrence, known in requests:
+            if (known is not None) != repeated:
+                continue
+            if repeated and occurrence not in receipts:
+                continue
+            key, _ = occurrence
+            candidates = [
+                edit for edit in pending_calls.get(key, [])
+                if id(edit) not in selected_ids
+            ]
+            if not candidates:
+                continue
+            if occurrence in receipts:
+                exact = [
+                    edit for edit in candidates
+                    if edit["tool_result"]
+                    and _coerce_json(edit["tool_result"]) == _coerce_json(receipts[occurrence])
+                ]
+                incomplete = [edit for edit in candidates if not edit["tool_result"]]
+                choices = exact or incomplete or ([] if repeated else candidates)
+            else:
+                choices = candidates
+            if choices:
+                edit = choices[0]
                 selected[occurrence] = edit
                 selected_ids.add(id(edit))
-                break
-    return selected
+                fresh_context = fresh_context or repeated
+    return selected, fresh_context
 
 
 def _common_import_messages(
