@@ -24,6 +24,8 @@ import logging
 import os
 import socket
 from dataclasses import dataclass, field
+from graphlib import CycleError, TopologicalSorter
+from heapq import heappop, heappush
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -414,33 +416,26 @@ def _spans_to_events(
     previous_trace_id: str | None = None
     pending_history: dict[tuple[str, str], list[dict[str, Any]]] = {}
     pending_calls: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    history_calls: dict[str, list[dict[str, Any]]] = {}
+    previous_calls: dict[tuple[tuple[str, str, str], int], dict[str, Any]] = {}
     history_observations: dict[tuple[str, tuple[str, str, str], int], dict[str, Any]] = {}
     mirrored_outputs = _mirrored_orchestration_outputs(spans) if include_inputs else set()
     if include_inputs:
-        if any(span.end_time_ns < span.start_time_ns for span in spans):
-            raise ValueError("Imported spans must end at or after their start time")
-        timeline = sorted(
-            (timestamp, priority, index, phase, span)
-            for index, span in enumerate(spans)
-            for timestamp, priority, phase in (
-                (span.start_time_ns, 1, 0),
-                (
-                    span.end_time_ns,
-                    0 if span.end_time_ns > span.start_time_ns or span.kind == "TOOL" else 2,
-                    1,
-                ),
-            )
-        )
+        timeline = _import_timeline(spans)
     else:
-        timeline = [(span.start_time_ns, 0, index, 1, span) for index, span in enumerate(spans)]
+        timeline = [(1, span) for span in spans]
 
-    for _, _, _, phase, span in timeline:
+    for phase, span in timeline:
         if phase == 0 and span.kind in {"LLM", "AGENT", "CHAIN"}:
             inputs = _import_input_messages(span)
             history_start = len(acc.events)
+            history_calls: dict[str, list[dict[str, Any]]] = {}
+            current_calls: dict[tuple[tuple[str, str, str], int], dict[str, Any]] = {}
             common = 0
-            if span.trace_id == previous_trace_id or len(inputs) > len(previous_inputs):
+            if (
+                span.trace_id == previous_trace_id
+                or len(inputs) > len(previous_inputs)
+                or any(message.get("role") in {"assistant", "tool"} for message in inputs)
+            ):
                 while (
                     common < min(len(previous_inputs), len(inputs))
                     and previous_inputs[common] == inputs[common]
@@ -456,16 +451,19 @@ def _spans_to_events(
                     "span_id": span.span_id,
                     "input_history": True,
                 }
+                context_before_calls = list(acc.events[history_start:])
                 text = _message_text(message)
                 if message_index >= common and role != "tool" and text:
                     key = (role, text)
                     if role == "assistant" and pending_history.get(key):
                         captured = pending_history[key].pop(0)
+                        context_before_calls.append(captured)
                         history_start = _place_history_before(
                             acc.events, history_start, captured["edit"]
                         )
                     else:
                         _append_import_message(acc, role, text, provenance)
+                        context_before_calls.append(acc.events[-1])
                 if role == "assistant":
                     for call in _merge_tool_call_carriers(
                         _extract_tool_calls(message), _extract_tool_calls_from_parts(message)
@@ -473,7 +471,12 @@ def _spans_to_events(
                         key = _import_call_key(call["call_id"], call["name"], call["args"])
                         if key is not None:
                             occurrences[key] = occurrences.get(key, 0) + 1
+                        occurrence = (key, occurrences[key]) if key is not None else None
                         if message_index < common:
+                            if occurrence is not None and occurrence in previous_calls:
+                                edit = previous_calls[occurrence]
+                                current_calls[occurrence] = edit
+                                history_calls.setdefault(call["call_id"], []).append(edit)
                             continue
                         observation = (
                             (span.trace_id, key, occurrences[key]) if key is not None else None
@@ -485,9 +488,8 @@ def _spans_to_events(
                             edit = matches.pop(0)
                             # Snapshot history can precede a captured action even
                             # when the snapshot's own span starts after that action.
-                            history_start = _place_history_before(
-                                acc.events, history_start, edit
-                            )
+                            _place_context_before(acc.events, context_before_calls, edit)
+                            history_start = len(acc.events)
                         else:
                             edit = acc.emit_tool_call(
                                 call["name"], call["args"], call_id=call["call_id"]
@@ -495,10 +497,10 @@ def _spans_to_events(
                             acc.events[-1]["raw"] = dict(provenance)
                         if observation is not None:
                             history_observations[observation] = edit
+                        if occurrence is not None:
+                            current_calls[occurrence] = edit
                         if call["call_id"]:
                             history_calls.setdefault(call["call_id"], []).append(edit)
-                if message_index < common:
-                    continue
                 if role == "tool":
                     for call_id, result in _import_tool_results(message):
                         matches = history_calls.get(call_id, []) if call_id else []
@@ -507,7 +509,7 @@ def _spans_to_events(
                             if edit["tool_result"] and _coerce_json(edit["tool_result"]) != _coerce_json(result):
                                 raise ValueError("Conflicting recorded results for an imported tool call")
                             edit["tool_result"] = result
-                        else:
+                        elif message_index >= common:
                             result_provenance = dict(provenance)
                             if call_id:
                                 result_provenance["tool_call_id"] = call_id
@@ -515,6 +517,7 @@ def _spans_to_events(
             if inputs:
                 previous_inputs = inputs
                 previous_trace_id = span.trace_id
+                previous_calls = current_calls
         if phase == 0:
             continue
         event_start = len(acc.events)
@@ -576,6 +579,109 @@ def _spans_to_events(
     return acc.events, aggregate
 
 
+def _import_timeline(spans: list[OTelSpan]) -> list[tuple[int, OTelSpan]]:
+    """Order tied events by their own, parent, and recorded-history dependencies."""
+    by_id = {(span.trace_id, span.span_id): index for index, span in enumerate(spans)}
+    ancestors: dict[int, set[int]] = {}
+    by_time: dict[int, list[tuple[int, int]]] = {}
+    input_refs: dict[int, set[tuple[str, Any]]] = {}
+    output_refs: dict[int, set[tuple[str, Any]]] = {}
+    histories: dict[int, list[str]] = {}
+    for index, span in enumerate(spans):
+        if span.end_time_ns < span.start_time_ns:
+            raise ValueError("Imported spans must end at or after their start time")
+        by_time.setdefault(span.start_time_ns, []).append((index, 0))
+        by_time.setdefault(span.end_time_ns, []).append((index, 1))
+        parents: set[int] = set()
+        parent_id = span.parent_span_id
+        while parent_id and (parent := by_id.get((span.trace_id, parent_id))) is not None:
+            if parent in parents:
+                break
+            parents.add(parent)
+            parent_id = spans[parent].parent_span_id
+        ancestors[index] = parents
+        refs: set[tuple[str, Any]] = set()
+        messages = _import_input_messages(span) if span.kind != "TOOL" else []
+        histories[index] = _import_history_signatures(messages)
+        for message in messages:
+            if message.get("role") != "assistant":
+                continue
+            if text := _message_text(message):
+                refs.add(("text", text))
+            for call in _extract_tool_calls(message) + _extract_tool_calls_from_parts(message):
+                if key := _import_call_key(call["call_id"], call["name"], call["args"]):
+                    refs.add(("call", key))
+        input_refs[index] = refs
+        refs = set()
+        if span.kind == "TOOL":
+            call_id = _span_tool_call_id(span) or _safe_tool_call_id(span.attributes.get("tool.id"))
+            if key := _import_call_key(call_id, _span_tool_name(span), _span_tool_args(span)):
+                refs.add(("call", key))
+        else:
+            if output := _span_output_value(span):
+                refs.add(("text", _genai_tool_result_str(output)))
+            for call in _span_requested_tool_calls(span):
+                if key := _import_call_key(call["call_id"], call["name"], call["args"]):
+                    refs.add(("call", key))
+        output_refs[index] = refs
+
+    timeline = []
+    for timestamp in sorted(by_time):
+        nodes = by_time[timestamp]
+        dependencies: dict[tuple[int, int], set[tuple[int, int]]] = {
+            node: set() for node in nodes
+        }
+        for index, phase in nodes:
+            if phase == 1 and (index, 0) in dependencies:
+                dependencies[index, phase].add((index, 0))
+            for parent in ancestors[index]:
+                if (parent, 0) in dependencies:
+                    dependencies[index, phase].add((parent, 0))
+            if phase == 0:
+                for source, source_phase in nodes:
+                    if (
+                        source_phase == 1 and source != index
+                        and index not in ancestors[source]
+                        and input_refs[index] & output_refs[source]
+                        and len(histories[index]) > len(histories[source])
+                        and histories[index][:len(histories[source])] == histories[source]
+                    ):
+                        dependencies[index, phase].add((source, 1))
+        sorter = TopologicalSorter(dependencies)
+        try:
+            sorter.prepare()
+        except CycleError as exc:
+            raise ValueError("Ambiguous causal ordering among tied imported spans") from exc
+        ready: list[tuple[int, int, int]] = []
+        while sorter.is_active():
+            for index, phase in sorter.get_ready():
+                span = spans[index]
+                priority = 0 if phase == 1 else 1 if span.start_time_ns == span.end_time_ns else 2
+                heappush(ready, (priority, index, phase))
+            _, index, phase = heappop(ready)
+            timeline.append((phase, spans[index]))
+            sorter.done((index, phase))
+    return timeline
+
+
+def _import_history_signatures(messages: list[dict[str, Any]]) -> list[str]:
+    signatures = []
+    for message in messages:
+        normalized = {
+            "role": message.get("role"),
+            "text": _message_text(message),
+            "calls": _merge_tool_call_carriers(
+                _extract_tool_calls(message), _extract_tool_calls_from_parts(message)
+            ),
+        }
+        if message.get("role") == "tool":
+            normalized["results"] = [
+                (call_id, _coerce_json(result)) for call_id, result in _import_tool_results(message)
+            ]
+        signatures.append(json.dumps(normalized, sort_keys=True, ensure_ascii=False))
+    return signatures
+
+
 def _place_history_before(
     events: list[dict[str, Any]], history_start: int, captured_edit: dict[str, Any],
 ) -> int:
@@ -586,6 +692,20 @@ def _place_history_before(
     del events[history_start:]
     events[anchor:anchor] = preceding
     return len(events)
+
+
+def _place_context_before(
+    events: list[dict[str, Any]], context: list[dict[str, Any]], captured_edit: dict[str, Any],
+) -> None:
+    if not context:
+        return
+    anchor = next(index for index, event in enumerate(events) if event["edit"] is captured_edit)
+    context_ids = {id(event) for event in context}
+    if not any(id(event) in context_ids for event in events[anchor:]):
+        return
+    events[:] = [event for event in events if id(event) not in context_ids]
+    anchor = next(index for index, event in enumerate(events) if event["edit"] is captured_edit)
+    events[anchor:anchor] = context
 
 
 def _append_import_message(

@@ -1049,3 +1049,233 @@ def test_history_context_precedes_its_matched_captured_action(tmp_path, text_cap
         "add_message",
     ]
     assert row["events"][1]["edit"]["message"]["content"] == "I will send it now."
+
+
+@pytest.mark.parametrize("tool_call", [False, True])
+@pytest.mark.parametrize("second_end", ["2", "3"])
+@pytest.mark.parametrize("reverse_export", [False, True])
+def test_tied_zero_duration_models_preserve_one_response(
+    tmp_path, tool_call, second_end, reverse_export
+):
+    user = {"role": "user", "content": "Question."}
+    response = (
+        historical_tool_messages()[1]
+        if tool_call
+        else {"role": "assistant", "content": "Answer."}
+    )
+    history = [user, response]
+    if tool_call:
+        history.append(historical_tool_messages()[-1])
+    history.append({"role": "user", "content": "Follow-up."})
+    first = genai_span(
+        "zero",
+        "LLM",
+        **{
+            "gen_ai.operation.name": "chat",
+            "gen_ai.input.messages": json.dumps([user]),
+            "gen_ai.output.messages": json.dumps([response]),
+        },
+    )
+    first.update(spanId="first", startTimeUnixNano="2", endTimeUnixNano="2")
+    second = genai_span(
+        "zero",
+        "LLM",
+        **{
+            "gen_ai.operation.name": "chat",
+            "gen_ai.input.messages": json.dumps(history),
+            "gen_ai.output.messages": json.dumps(
+                [{"role": "assistant", "content": "Final."}]
+            ),
+        },
+    )
+    second.update(spanId="second", startTimeUnixNano="2", endTimeUnixNano=second_end)
+    path = tmp_path / "traces.json"
+    write_spans(path, [second, first] if reverse_export else [first, second])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    edits = [event["edit"] for event in row["events"]]
+    if tool_call:
+        [call] = [edit for edit in edits if edit["type"] == "tool_call"]
+        assert json.loads(call["tool_result"]) == {"status": "sent"}
+        assert [
+            edit["message"]["content"]
+            for edit in edits
+            if edit["type"] == "add_message"
+        ] == [
+            "Question.",
+            "Follow-up.",
+            "Final.",
+        ]
+    else:
+        assert [edit["message"]["content"] for edit in edits] == [
+            "Question.",
+            "Answer.",
+            "Follow-up.",
+            "Final.",
+        ]
+
+
+@pytest.mark.parametrize("assistant_text", ["", "I will perform both transfers."])
+def test_parallel_completions_cannot_precede_recovered_authorization(
+    tmp_path, assistant_text
+):
+    tools = [
+        span(
+            "parallel",
+            "TOOL",
+            **{
+                "tool.name": name,
+                "tool.id": name,
+                "input.value": "{}",
+                "output.value": name + "-receipt",
+            },
+        )
+        for name in ("slow", "fast")
+    ]
+    tools[0].update(spanId="slow", endTimeUnixNano="3")
+    tools[1].update(spanId="fast", endTimeUnixNano="2")
+    history = [
+        {"role": "user", "content": "I authorize both transfers."},
+        {
+            "role": "assistant",
+            "content": assistant_text,
+            "tool_calls": [
+                {"id": name, "function": {"name": name, "arguments": "{}"}}
+                for name in ("slow", "fast")
+            ],
+        },
+        *[
+            {"role": "tool", "tool_call_id": name, "content": name + "-receipt"}
+            for name in ("slow", "fast")
+        ],
+    ]
+    model = span(
+        "parallel",
+        "LLM",
+        **{"input.value": json.dumps(history), "output.value": "Complete."},
+    )
+    model.update(startTimeUnixNano="4", endTimeUnixNano="5")
+    path = tmp_path / "traces.json"
+    write_spans(path, [*tools, model])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    edits = [event["edit"] for event in row["events"]]
+    assert edits[0]["message"]["content"] == "I authorize both transfers."
+    if assistant_text:
+        assert edits[1]["message"]["content"] == assistant_text
+    assert {edit["tool_name"] for edit in edits if edit["type"] == "tool_call"} == {
+        "slow",
+        "fast",
+    }
+
+
+@pytest.mark.parametrize("different_trace", [False, True])
+def test_common_history_prefix_cannot_hide_conflicting_receipts(
+    tmp_path, different_trace
+):
+    history = historical_tool_messages()
+    history[-1] = {
+        "role": "tool",
+        "parts": [
+            {
+                "type": "tool_call_response",
+                "id": "call-1",
+                "response": {"status": "blocked"},
+            }
+        ],
+    }
+    first = span(
+        "conflict",
+        "LLM",
+        **{"input.value": json.dumps(history), "output.value": "Complete."},
+    )
+    first.update(spanId="first")
+    history[-1]["parts"][0]["response"]["status"] = "sent"
+    second = span(
+        "conflict",
+        "LLM",
+        **{"input.value": json.dumps(history), "output.value": "Complete."},
+    )
+    second.update(spanId="second", startTimeUnixNano="3", endTimeUnixNano="4")
+    if different_trace:
+        second["traceId"] = "other-trace"
+    path = tmp_path / "traces.json"
+    write_spans(path, [first, second])
+    with pytest.raises(ValueError, match="Conflicting recorded results"):
+        parse_otel_traces(path, include_inputs=True)
+
+
+def test_tied_child_completion_cannot_precede_parent_input(tmp_path):
+    root = span(
+        "parent",
+        "AGENT",
+        **{"input.value": "Authorized request.", "output.value": "Complete."},
+    )
+    root.update(startTimeUnixNano="2", endTimeUnixNano="3")
+    child = span(
+        "parent",
+        "TOOL",
+        **{"tool.name": "lookup", "input.value": "{}", "output.value": "record"},
+    )
+    child.update(
+        parentSpanId=root["spanId"], startTimeUnixNano="2", endTimeUnixNano="2"
+    )
+    path = tmp_path / "traces.json"
+    write_spans(path, [child, root])
+    [row] = parse_otel_traces(path, include_inputs=True)
+    assert row["events"][0]["edit"]["message"]["content"] == "Authorized request."
+    assert row["events"][1]["edit"]["type"] == "tool_call"
+
+
+def test_cyclic_tied_parent_dependencies_fail_explicitly(tmp_path):
+    records = []
+    for name, other in (("one", "two"), ("two", "one")):
+        record = span(
+            "cycle",
+            "LLM",
+            **{
+                "input.value": json.dumps([{"role": "assistant", "content": other}]),
+                "output.value": name,
+            },
+        )
+        record.update(
+            spanId=name, parentSpanId=other, startTimeUnixNano="2", endTimeUnixNano="2"
+        )
+        records.append(record)
+    path = tmp_path / "traces.json"
+    write_spans(path, records)
+    with pytest.raises(ValueError, match="Ambiguous causal ordering"):
+        parse_otel_traces(path, include_inputs=True)
+
+
+def test_equal_text_in_independent_zero_duration_outputs_is_not_a_causal_cycle(
+    tmp_path,
+):
+    history = [
+        {"role": "user", "content": "Question."},
+        {"role": "assistant", "content": "Complete."},
+    ]
+    first = span(
+        "same-text", "LLM", **{"input.value": "Question.", "output.value": "Complete."}
+    )
+    first.update(spanId="first", startTimeUnixNano="0", endTimeUnixNano="1")
+    records = [first]
+    for name in ("second", "third"):
+        record = span(
+            "same-text",
+            "LLM",
+            **{
+                "input.value": json.dumps(history),
+                "output.value": "Complete.",
+            },
+        )
+        record.update(spanId=name, startTimeUnixNano="2", endTimeUnixNano="2")
+        records.append(record)
+    path = tmp_path / "traces.json"
+    write_spans(path, records)
+    [row] = parse_otel_traces(path, include_inputs=True)
+    assert (
+        sum(
+            event["edit"].get("message", {}).get("content") == "Complete."
+            for event in row["events"]
+        )
+        == 3
+    )

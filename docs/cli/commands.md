@@ -224,8 +224,9 @@ execution receipt is an attempted action, not proof of a side effect.
 Imports retain final outputs recorded on root chain/agent spans and structured tool
 requests in message history. Matching parent/child outputs are deduplicated only when
 the span lineage identifies the child; tool history is correlated by call ID, name,
-and arguments. Conflicting recorded results fail the import instead of choosing a
-result silently. Evidence eligibility is checked against the reconstructed transcript,
+and arguments. Conflicting recorded results or contradictory causal relationships
+at tied timestamps fail the import instead of choosing silently.
+Evidence eligibility is checked against the reconstructed transcript,
 so a source field that the parser cannot represent does not make an empty row scoreable.
 
 ## `acs generate`
