@@ -1279,3 +1279,106 @@ def test_equal_text_in_independent_zero_duration_outputs_is_not_a_causal_cycle(
         )
         == 3
     )
+
+
+def captured_observation(trace_id, start, call_id, receipt, history):
+    tool = span(
+        "captured-session",
+        "TOOL",
+        **{
+            "tool.name": "send_external",
+            "tool.id": call_id,
+            "input.value": '{"message":"CANARY"}',
+            "output.value": receipt,
+        },
+    )
+    tool.update(
+        traceId=trace_id,
+        spanId=f"tool-{start}",
+        startTimeUnixNano=str(start),
+        endTimeUnixNano=str(start + 1),
+    )
+    model = span(
+        "captured-session",
+        "LLM",
+        **{
+            "input.value": json.dumps(history),
+            "output.value": "Complete.",
+        },
+    )
+    model.update(
+        traceId=trace_id,
+        spanId=f"model-{start}",
+        startTimeUnixNano=str(start + 2),
+        endTimeUnixNano=str(start + 3),
+    )
+    return [tool, model]
+
+
+@pytest.mark.parametrize("different_trace", [False, True])
+@pytest.mark.parametrize("same_receipt", [False, True])
+def test_fresh_capture_overrides_a_reused_history_occurrence(
+    tmp_path, different_trace, same_receipt
+):
+    first_history = historical_tool_messages()
+    first_history[-1]["content"] = "first-receipt"
+    second_history = historical_tool_messages()
+    second_receipt = "first-receipt" if same_receipt else "second-receipt"
+    second_history[-1]["content"] = second_receipt
+    records = [
+        *captured_observation("trace-one", 1, "call-1", "first-receipt", first_history),
+        *captured_observation(
+            "trace-two" if different_trace else "trace-one",
+            5,
+            "call-1",
+            second_receipt,
+            second_history,
+        ),
+    ]
+    path = tmp_path / "traces.json"
+    write_spans(path, records)
+    [row] = parse_otel_traces(path, include_inputs=True)
+    calls = [
+        event["edit"] for event in row["events"] if event["edit"]["type"] == "tool_call"
+    ]
+    assert [call["tool_result"] for call in calls] == ["first-receipt", second_receipt]
+    users = [event["edit"].get("message", {}) for event in row["events"]]
+    assert sum(message.get("role") == "user" for message in users) == 2
+
+
+@pytest.mark.parametrize("same_receipt", [False, True])
+@pytest.mark.parametrize("changed_system", [False, True])
+@pytest.mark.parametrize("reused_id", [False, True])
+def test_continuing_history_reserves_capture_for_the_new_request(
+    tmp_path, same_receipt, changed_system, reused_id
+):
+    first_history = [
+        {"role": "system", "content": "Original instructions."},
+        *historical_tool_messages(),
+    ]
+    first_history[-1]["content"] = "first-receipt"
+    next_id = "call-1" if reused_id else "call-2"
+    next_history = historical_tool_messages(next_id)
+    next_history[0]["content"] = "Again."
+    second_receipt = "first-receipt" if same_receipt else "second-receipt"
+    next_history[-1]["content"] = second_receipt
+    continued = [*first_history, *next_history]
+    if changed_system:
+        continued[0] = {"role": "system", "content": "Updated instructions."}
+    records = [
+        *captured_observation("trace-one", 1, "call-1", "first-receipt", first_history),
+        *captured_observation("trace-two", 5, next_id, second_receipt, continued),
+    ]
+    path = tmp_path / "traces.json"
+    write_spans(path, records)
+    [row] = parse_otel_traces(path, include_inputs=True)
+    calls = [
+        event["edit"] for event in row["events"] if event["edit"]["type"] == "tool_call"
+    ]
+    assert [call["tool_result"] for call in calls] == ["first-receipt", second_receipt]
+    users = [
+        event["edit"].get("message", {}).get("content")
+        for event in row["events"]
+        if event["edit"].get("message", {}).get("role") == "user"
+    ]
+    assert users == ["Look up a record.", "Again."]

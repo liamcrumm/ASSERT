@@ -31,6 +31,9 @@ from typing import Any, Protocol, runtime_checkable
 
 log = logging.getLogger(__name__)
 
+_ImportCallKey = tuple[str, str, str]
+_ImportOccurrence = tuple[_ImportCallKey, int]
+
 
 # OpenInference semantic conventions
 # https://arize-ai.github.io/openinference/
@@ -418,6 +421,8 @@ def _spans_to_events(
     pending_calls: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     previous_calls: dict[tuple[tuple[str, str, str], int], dict[str, Any]] = {}
     history_observations: dict[tuple[str, tuple[str, str, str], int], dict[str, Any]] = {}
+    capture_order: dict[int, int] = {}
+    previous_capture_order = 0
     mirrored_outputs = _mirrored_orchestration_outputs(spans) if include_inputs else set()
     if include_inputs:
         timeline = _import_timeline(spans)
@@ -430,17 +435,17 @@ def _spans_to_events(
             history_start = len(acc.events)
             history_calls: dict[str, list[dict[str, Any]]] = {}
             current_calls: dict[tuple[tuple[str, str, str], int], dict[str, Any]] = {}
-            common = 0
+            common: set[int] = set()
             if (
                 span.trace_id == previous_trace_id
                 or len(inputs) > len(previous_inputs)
                 or any(message.get("role") in {"assistant", "tool"} for message in inputs)
             ):
-                while (
-                    common < min(len(previous_inputs), len(inputs))
-                    and previous_inputs[common] == inputs[common]
-                ):
-                    common += 1
+                common = _common_import_messages(previous_inputs, inputs)
+            fresh_captures = _fresh_import_captures(
+                inputs, common, span.trace_id, previous_calls, history_observations,
+                pending_calls, capture_order, previous_capture_order,
+            )
             occurrences: dict[tuple[str, str, str], int] = {}
             for message_index, message in enumerate(inputs):
                 role = message.get("role")
@@ -453,7 +458,7 @@ def _spans_to_events(
                 }
                 context_before_calls = list(acc.events[history_start:])
                 text = _message_text(message)
-                if message_index >= common and role != "tool" and text:
+                if (message_index not in common or fresh_captures) and role != "tool" and text:
                     key = (role, text)
                     if role == "assistant" and pending_history.get(key):
                         captured = pending_history[key].pop(0)
@@ -472,7 +477,8 @@ def _spans_to_events(
                         if key is not None:
                             occurrences[key] = occurrences.get(key, 0) + 1
                         occurrence = (key, occurrences[key]) if key is not None else None
-                        if message_index < common:
+                        fresh = fresh_captures.get(occurrence) if occurrence is not None else None
+                        if message_index in common and fresh is None:
                             if occurrence is not None and occurrence in previous_calls:
                                 edit = previous_calls[occurrence]
                                 current_calls[occurrence] = edit
@@ -482,7 +488,12 @@ def _spans_to_events(
                             (span.trace_id, key, occurrences[key]) if key is not None else None
                         )
                         matches = pending_calls.get(key, []) if key is not None else []
-                        if observation is not None and observation in history_observations:
+                        if fresh is not None:
+                            edit = fresh
+                            matches.pop(next(index for index, candidate in enumerate(matches) if candidate is edit))
+                            _place_context_before(acc.events, context_before_calls, edit)
+                            history_start = len(acc.events)
+                        elif observation is not None and observation in history_observations:
                             edit = history_observations[observation]
                         elif matches:
                             edit = matches.pop(0)
@@ -509,7 +520,7 @@ def _spans_to_events(
                             if edit["tool_result"] and _coerce_json(edit["tool_result"]) != _coerce_json(result):
                                 raise ValueError("Conflicting recorded results for an imported tool call")
                             edit["tool_result"] = result
-                        elif message_index >= common:
+                        elif message_index not in common:
                             result_provenance = dict(provenance)
                             if call_id:
                                 result_provenance["tool_call_id"] = call_id
@@ -518,6 +529,7 @@ def _spans_to_events(
                 previous_inputs = inputs
                 previous_trace_id = span.trace_id
                 previous_calls = current_calls
+                previous_capture_order = len(capture_order)
         if phase == 0:
             continue
         event_start = len(acc.events)
@@ -561,6 +573,7 @@ def _spans_to_events(
                     )
                     if key is not None:
                         pending_calls.setdefault(key, []).append(edit)
+                        capture_order[id(edit)] = len(capture_order) + 1
                 if role == "assistant" and isinstance(text, str) and text:
                     key = (role, text)
                     pending_history.setdefault(key, []).append(event)
@@ -577,6 +590,82 @@ def _spans_to_events(
     }
 
     return acc.events, aggregate
+
+
+def _fresh_import_captures(
+    inputs: list[dict[str, Any]], common: set[int], trace_id: str,
+    previous_calls: dict[_ImportOccurrence, dict[str, Any]],
+    observations: dict[tuple[str, _ImportCallKey, int], dict[str, Any]],
+    pending_calls: dict[_ImportCallKey, list[dict[str, Any]]],
+    capture_order: dict[int, int], previous_capture_order: int,
+) -> dict[_ImportOccurrence, dict[str, Any]]:
+    """Reserve new captures for new requests before replacing repeated observations."""
+    counts: dict[_ImportCallKey, int] = {}
+    requests: list[tuple[_ImportOccurrence, dict[str, Any] | None]] = []
+    awaiting: dict[str, list[_ImportOccurrence]] = {}
+    receipts: dict[_ImportOccurrence, str] = {}
+    for index, message in enumerate(inputs):
+        if message.get("role") == "assistant":
+            for call in _merge_tool_call_carriers(
+                _extract_tool_calls(message), _extract_tool_calls_from_parts(message)
+            ):
+                key = _import_call_key(call["call_id"], call["name"], call["args"])
+                if key is None:
+                    continue
+                counts[key] = counts.get(key, 0) + 1
+                occurrence = (key, counts[key])
+                known = (
+                    previous_calls.get(occurrence) if index in common
+                    else observations.get((trace_id, key, counts[key]))
+                )
+                requests.append((occurrence, known))
+                awaiting.setdefault(call["call_id"], []).append(occurrence)
+        elif message.get("role") == "tool":
+            for call_id, result in _import_tool_results(message):
+                if call_id and awaiting.get(call_id):
+                    receipts[awaiting[call_id].pop(0)] = result
+    reserved: dict[tuple[str, str, str], int] = {}
+    for (key, _), known in requests:
+        if known is None:
+            reserved[key] = reserved.get(key, 0) + 1
+    selected: dict[_ImportOccurrence, dict[str, Any]] = {}
+    selected_ids: set[int] = set()
+    for occurrence, known in requests:
+        if known is None or occurrence not in receipts:
+            continue
+        key, _ = occurrence
+        candidates = [
+            edit for edit in pending_calls.get(key, [])
+            if capture_order.get(id(edit), 0) > previous_capture_order
+            and id(edit) not in selected_ids
+        ]
+        if len(candidates) <= reserved.get(key, 0):
+            continue
+        for edit in candidates:
+            if not edit["tool_result"] or _coerce_json(edit["tool_result"]) == _coerce_json(receipts[occurrence]):
+                selected[occurrence] = edit
+                selected_ids.add(id(edit))
+                break
+    return selected
+
+
+def _common_import_messages(
+    previous: list[dict[str, Any]], current: list[dict[str, Any]],
+) -> set[int]:
+    """Instruction changes do not turn repeated conversation history into new actions."""
+    common: set[int] = set()
+    for system in (False, True):
+        old = [message for message in previous if (message.get("role") == "system") == system]
+        indexed = [(index, message) for index, message in enumerate(current)
+                   if (message.get("role") == "system") == system]
+        for (index, _), old_signature, signature in zip(
+            indexed, _import_history_signatures(old),
+            _import_history_signatures([message for _, message in indexed]),
+        ):
+            if old_signature != signature:
+                break
+            common.add(index)
+    return common
 
 
 def _import_timeline(spans: list[OTelSpan]) -> list[tuple[int, OTelSpan]]:
@@ -602,7 +691,9 @@ def _import_timeline(spans: list[OTelSpan]) -> list[tuple[int, OTelSpan]]:
         ancestors[index] = parents
         refs: set[tuple[str, Any]] = set()
         messages = _import_input_messages(span) if span.kind != "TOOL" else []
-        histories[index] = _import_history_signatures(messages)
+        histories[index] = _import_history_signatures(
+            [message for message in messages if message.get("role") != "system"]
+        )
         for message in messages:
             if message.get("role") != "assistant":
                 continue
