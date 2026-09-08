@@ -228,6 +228,9 @@ and arguments. Conflicting recorded results or contradictory causal relationship
 at tied timestamps fail the import instead of choosing silently.
 Evidence eligibility is checked against the reconstructed transcript,
 so a source field that the parser cannot represent does not make an empty row scoreable.
+Repeated history retains its established action bindings across intervening wrappers.
+It cannot transfer a receipt to an earlier-captured or incomplete action; replacing
+a captured binding requires a later capture that records the matching receipt.
 
 ## `acs generate`
 

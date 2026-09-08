@@ -1169,8 +1169,9 @@ def test_parallel_completions_cannot_precede_recovered_authorization(
 
 
 @pytest.mark.parametrize("different_trace", [False, True])
+@pytest.mark.parametrize("intervening_wrapper", [False, True])
 def test_common_history_prefix_cannot_hide_conflicting_receipts(
-    tmp_path, different_trace
+    tmp_path, different_trace, intervening_wrapper
 ):
     history = historical_tool_messages()
     history[-1] = {
@@ -1199,7 +1200,18 @@ def test_common_history_prefix_cannot_hide_conflicting_receipts(
     if different_trace:
         second["traceId"] = "other-trace"
     path = tmp_path / "traces.json"
-    write_spans(path, [first, second])
+    records = [first, second]
+    if intervening_wrapper:
+        wrapper = span("conflict", "CHAIN", **{"input.value": "Prepare."})
+        wrapper.update(
+            traceId=second["traceId"],
+            spanId="wrapper",
+            startTimeUnixNano="2",
+            endTimeUnixNano="5",
+        )
+        second["parentSpanId"] = "wrapper"
+        records.append(wrapper)
+    write_spans(path, records)
     with pytest.raises(ValueError, match="Conflicting recorded results"):
         parse_otel_traces(path, include_inputs=True)
 
@@ -1463,3 +1475,108 @@ def test_new_request_selects_receipt_compatible_pending_capture(
         if event["edit"]["type"] == "tool_call"
     ]
     assert call_positions[0] < authorization < call_positions[1]
+
+
+def test_compatible_prefix_match_precedes_incompatible_suffix_fallback(tmp_path):
+    first_history = historical_tool_messages()
+    first_history[0]["content"] = "First."
+    first_history[-1]["content"] = "old-receipt"
+    suffix = historical_tool_messages()
+    suffix[0]["content"] = "Again."
+    suffix[-1]["content"] = "new-receipt"
+    records = [
+        *captured_observation("trace", 1, "call-1", "old-receipt", first_history),
+        *captured_observation(
+            "trace", 5, "call-1", "old-receipt", [*first_history, *suffix]
+        ),
+    ]
+    path = tmp_path / "traces.json"
+    write_spans(path, records)
+    [row] = parse_otel_traces(path, include_inputs=True)
+    calls = [
+        event["edit"] for event in row["events"] if event["edit"]["type"] == "tool_call"
+    ]
+    assert [call["tool_result"] for call in calls] == [
+        "old-receipt",
+        "old-receipt",
+        "new-receipt",
+    ]
+    users = [
+        event["edit"]["message"]["content"]
+        for event in row["events"]
+        if event["edit"].get("message", {}).get("role") == "user"
+    ]
+    assert users == ["First.", "Again."]
+
+
+@pytest.mark.parametrize("incomplete_is_older", [False, True])
+@pytest.mark.parametrize("intervening_wrapper", [False, True])
+@pytest.mark.parametrize("different_trace", [False, True])
+def test_repeated_observation_cannot_complete_an_unrelated_capture(
+    tmp_path, incomplete_is_older, intervening_wrapper, different_trace
+):
+    history = historical_tool_messages()
+    history[-1]["content"] = "recorded-receipt"
+    incomplete_start, complete_start = (1, 5) if incomplete_is_older else (5, 1)
+    incomplete = captured_observation("trace", incomplete_start, "call-1", "", history)[
+        0
+    ]
+    complete = captured_observation(
+        "trace", complete_start, "call-1", "recorded-receipt", history
+    )[0]
+    first_model = captured_observation(
+        "trace", 7, "call-1", "recorded-receipt", history
+    )[1]
+    repeat_model = captured_observation(
+        "trace", 11, "call-1", "recorded-receipt", history
+    )[1]
+    if different_trace:
+        repeat_model["traceId"] = "other-trace"
+    path = tmp_path / "traces.json"
+
+    def receipts(records):
+        write_spans(path, records)
+        [row] = parse_otel_traces(path, include_inputs=True)
+        return {
+            event["raw"]["span_id"]: event["edit"]["tool_result"]
+            for event in row["events"]
+            if event["edit"]["type"] == "tool_call"
+        }
+
+    before = receipts([incomplete, complete, first_model])
+    repeated = [incomplete, complete, first_model, repeat_model]
+    if intervening_wrapper:
+        wrapper = span("captured-session", "CHAIN", **{"input.value": "Prepare."})
+        wrapper.update(
+            traceId=repeat_model["traceId"],
+            spanId="wrapper",
+            startTimeUnixNano="11",
+            endTimeUnixNano="16",
+        )
+        repeat_model["parentSpanId"] = "wrapper"
+        repeated.append(wrapper)
+    after = receipts(repeated)
+    assert (
+        before
+        == after
+        == {
+            f"tool-{incomplete_start}": "",
+            f"tool-{complete_start}": "recorded-receipt",
+        }
+    )
+
+
+def test_repeated_occurrence_cannot_rebind_to_an_older_completed_capture(tmp_path):
+    history = historical_tool_messages()
+    history[-1]["content"] = "new-receipt"
+    old = captured_observation("trace", 1, "call-1", "old-receipt", history)[0]
+    new, model = captured_observation("trace", 5, "call-1", "new-receipt", history)
+    conflicting = historical_tool_messages()
+    conflicting[-1]["content"] = "old-receipt"
+    repeat_model = captured_observation(
+        "trace", 9, "call-1", "old-receipt", conflicting
+    )[1]
+    path = tmp_path / "traces.json"
+    write_spans(path, [old, new, model, repeat_model])
+    with pytest.raises(ValueError, match="Conflicting recorded results"):
+        parse_otel_traces(path, include_inputs=True)
